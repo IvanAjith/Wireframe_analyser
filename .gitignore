@@ -1,0 +1,17 @@
+# Wireframes you drop in for analysis -- personal/work files, not repo content
+source/*
+!source/.gitkeep
+
+# Generated documents -- regenerate anytime, no need to version these
+output/*
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
