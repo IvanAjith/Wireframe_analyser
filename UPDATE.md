@@ -1,38 +1,51 @@
-# UPDATE — Applying a Fix/Enhancement From Claude
+# UPDATE — Pushing a Fix From Claude Into GitHub
 
-Claude cannot push to your GitHub directly — no credentials are stored or
-shared between chat sessions, by design. Instead, every time a change is
-made to this tool in chat, you'll get:
+Claude cannot push to your GitHub itself — no credentials are ever
+stored or shared in chat. Every time a change is made to this tool, you
+get updated file(s) as a download, plus the block below. You download,
+paste, run. That's the entire process, every time.
 
-1. An updated file (e.g. `wireframe_analyzer.py`) as a download, **and**
-2. A ready-to-run command block like the one below.
+---
 
-Your side of it is: download the file, then copy-paste the block into
-your terminal. Nothing else to figure out.
+## The block (100% copy-paste, nothing to edit)
 
-## The standard update block
+1. **Download** every file Claude gives you in that message (click each
+   attachment — they land in `~/Downloads` by default).
 
-Downloaded files usually land in `~/Downloads`. Adjust the two paths
-below if yours are different, then run it as-is:
-
+2. **Paste this into Terminal and run it.** List one `mv` + `git add`
+   pair per file Claude gave you — copy the two lines below and repeat
+   them for each filename:
 ```bash
-cd ~/Downloads/Wireframe_analyser              # your local repo folder
-mv ~/Downloads/wireframe_analyzer.py .          # overwrite with the new version
-git add wireframe_analyzer.py
-git commit -m "Update from Claude: <short description of the fix>"
+cd ~/Downloads/Wireframe_analyser
+mv ~/Downloads/FILENAME .
+git add FILENAME
+git commit -m "Update from Claude"
 git push
 ```
 
-If `run.py` or another file was also updated, add an extra `mv`/`git add`
-line for each one before the commit, e.g.:
+**Real example** — if Claude gave you `wireframe_analyzer.py` and
+`run.py` in one message:
 ```bash
+cd ~/Downloads/Wireframe_analyser
+mv ~/Downloads/wireframe_analyzer.py .
+git add wireframe_analyzer.py
 mv ~/Downloads/run.py .
 git add run.py
+git commit -m "Update from Claude"
+git push
 ```
 
-## Getting the update on a different machine
+Note: if a file listed above doesn't actually exist in `~/Downloads`
+(e.g. it saved somewhere else, or under a slightly different name), the
+`mv` line for it will print a harmless "No such file or directory" and
+do nothing — `git add`/`commit`/`push` still run fine for whichever files
+*did* move successfully. Check `git status` afterward if unsure what
+actually got committed.
 
-Once pushed, any other machine just needs to pull it:
+---
+
+## Getting that update onto a different machine
+
 ```bash
 cd Wireframe_analyser
 git pull
@@ -40,9 +53,7 @@ git pull
 
 ## If `git push` is rejected
 
-This usually means the remote has a commit your local copy doesn't (e.g.
-you updated from a different machine and forgot to `git pull` here
-first). Fix:
+Means the remote has something your local copy doesn't yet:
 ```bash
 git pull --rebase
 git push
