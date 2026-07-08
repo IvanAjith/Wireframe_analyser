@@ -42,14 +42,14 @@ def next_available_path(base_path):
 
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: python3 run.py <wireframe_filename> [extra flags]")
         print(f"\nThe file must already be inside: {SOURCE_DIR}")
         print("\nExamples:")
         print("  python3 run.py homepage.html")
         print("  python3 run.py dashboard.png")
         print("  python3 run.py report.html --canvas 1920x1080")
-        sys.exit(1)
+        sys.exit(0 if len(sys.argv) >= 2 else 1)
 
     filename = sys.argv[1]
     extra_args = sys.argv[2:]  # passed straight through to wireframe_analyzer.py

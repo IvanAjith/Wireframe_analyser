@@ -5,6 +5,9 @@ specification document** — organized Block → Visual (the background card,
 then every individual thing sitting on it), with exact position, size,
 font, and color for each, ready to hand to a Power BI/Canva build.
 
+> New machine? Start with **`SETUP.md`**.
+> Applying a fix Claude gave you in chat? Start with **`UPDATE.md`**.
+
 ## Quick start
 
 ```bash
