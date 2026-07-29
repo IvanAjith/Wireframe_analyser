@@ -126,27 +126,80 @@ JS_EXTRACT = r"""
 """
 
 
-def detect_html_canvas_size(path, probe_width=1280, probe_height=900):
-    """Render once at a generous probe viewport and read back the page's
-    real content size (document.documentElement.scrollWidth/Height). Works
-    for both fixed-size dashboards (canvas == the probe size, unchanged)
-    and tall, naturally-scrolling report pages (canvas height grows to fit
-    the real content)."""
-    from playwright.sync_api import sync_playwright
+JS_DETECT_PAGE_GROUP = r"""
+() => {
+  const all = document.querySelectorAll('body *');
+  const classGroups = {};
+  all.forEach(el => {
+    if (!el.className || typeof el.className !== 'string') return;
+    el.className.trim().split(/\s+/).forEach(cls => {
+      if (!cls) return;
+      if (!classGroups[cls]) classGroups[cls] = [];
+      classGroups[cls].push(el);
+    });
+  });
 
-    abs_path = os.path.abspath(path)
-    url = f"file://{abs_path}"
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": probe_width, "height": probe_height})
-        page.goto(url)
-        page.wait_for_timeout(300)
-        dims = page.evaluate("() => ({w: document.body.offsetWidth, h: document.body.offsetHeight})")
-        browser.close()
-    return dims["w"], dims["h"]
+  let best = null;
+  for (const [cls, els] of Object.entries(classGroups)) {
+    if (els.length < 2 || els.length > 40) continue;
+    const infos = els.map(el => ({ el, display: window.getComputedStyle(el).display }));
+    const visibleCount = infos.filter(i => i.display !== 'none').length;
+    const hiddenCount = infos.length - visibleCount;
+    // the classic toggled-page/tab pattern: several share a class, most are
+    // hidden, one (or a couple) currently shown
+    if (hiddenCount < 1 || visibleCount < 1 || visibleCount > 2) continue;
+    if (!best || els.length > best.els.length) {
+      best = { cls, els: infos.map(i => i.el) };
+    }
+  }
+  if (!best) return null;
+
+  function findLabel(el) {
+    const id = el.id || '';
+    const suffix = id.replace(/^(page|tab|view|section)[-_]?/i, '');
+    const candidates = document.querySelectorAll('[onclick], [data-target], [data-page], [href]');
+    for (const c of candidates) {
+      const blob = (c.getAttribute('onclick') || '') + ' ' + (c.getAttribute('data-target') || '') +
+                   ' ' + (c.getAttribute('data-page') || '') + ' ' + (c.getAttribute('href') || '');
+      if ((suffix && blob.includes(suffix)) || (id && blob.includes(id))) {
+        const t = c.innerText && c.innerText.trim();
+        if (t) return t;
+      }
+    }
+    return null;
+  }
+
+  return {
+    groupClass: best.cls,
+    pages: best.els.map((el, i) => ({
+      index: i,
+      id: el.id || null,
+      label: findLabel(el) || el.id || `Page ${i + 1}`,
+    })),
+  };
+}
+"""
+
+JS_SHOW_ONLY = r"""
+(args) => {
+  const { groupClass, targetId, targetIndex } = args;
+  const els = Array.from(document.getElementsByClassName(groupClass));
+  els.forEach((el, i) => {
+    const isTarget = targetId ? (el.id === targetId) : (i === targetIndex);
+    el.style.setProperty('display', isTarget ? 'block' : 'none', 'important');
+  });
+}
+"""
 
 
-def analyze_html(path, canvas_w, canvas_h, screenshot_path=None):
+def detect_and_extract_pages(path, canvas_w, canvas_h, work_dir=None):
+    """If this HTML has multiple tab/page-style sections (several sibling
+    elements sharing a class, toggled via display:none/block -- the
+    standard pattern for hand-built dashboard mockups with a tab bar),
+    extract each one separately. Returns a list of
+    {label, canvas, rows, screenshot_path} dicts, or None if no such
+    multi-page pattern was detected (caller should fall back to normal
+    single-page analysis)."""
     from playwright.sync_api import sync_playwright
 
     abs_path = os.path.abspath(path)
@@ -156,24 +209,68 @@ def analyze_html(path, canvas_w, canvas_h, screenshot_path=None):
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": canvas_w, "height": canvas_h})
         page.goto(url)
-        page.wait_for_timeout(300)  # let fonts/layout settle
-        data = page.evaluate(JS_EXTRACT)
-        if screenshot_path:
-            page.screenshot(path=screenshot_path)
+        page.wait_for_timeout(300)
+
+        group = page.evaluate(JS_DETECT_PAGE_GROUP)
+        if not group or len(group["pages"]) < 2:
+            browser.close()
+            return None
+
+        results = []
+        for p_info in group["pages"]:
+            page.evaluate(JS_SHOW_ONLY, {
+                "groupClass": group["groupClass"],
+                "targetId": p_info["id"],
+                "targetIndex": p_info["index"],
+            })
+            page.wait_for_timeout(150)
+
+            # this page's real content may be taller than the initial probe
+            # viewport (each tab can have very different content length) --
+            # resize to fit so nothing gets clipped in the screenshot or
+            # miscounted as "exceeds canvas"
+            content_h = page.evaluate("() => document.body.offsetHeight")
+            page_canvas_h = max(canvas_h, content_h + 10)
+            if page_canvas_h != canvas_h:
+                page.set_viewport_size({"width": canvas_w, "height": page_canvas_h})
+                page.wait_for_timeout(100)
+
+            data = page.evaluate(JS_EXTRACT)
+
+            screenshot_path = None
+            if work_dir:
+                os.makedirs(work_dir, exist_ok=True)
+                safe_label = "".join(c if c.isalnum() else "_" for c in p_info["label"])[:40]
+                screenshot_path = os.path.join(work_dir, f"page_{p_info['index']+1}_{safe_label}.png")
+                page.screenshot(path=screenshot_path)
+
+            kept, texts = _elements_to_rows(data["elements"], canvas_w, page_canvas_h)
+            canvas, rows = _build_rows_from_containers(kept, texts, canvas_w, page_canvas_h,
+                                                         data["page"]["w"], data["page"]["h"])
+
+            results.append({
+                "label": p_info["label"],
+                "canvas": canvas,
+                "rows": rows,
+                "screenshot_path": screenshot_path,
+            })
+
+            if page_canvas_h != canvas_h:
+                page.set_viewport_size({"width": canvas_w, "height": canvas_h})
+
         browser.close()
+    return results
 
-    elements = data["elements"]
 
-    # Split into "containers" (have background/border, act as visual cards)
-    # vs "text" elements (carry the actual font info we care about).
+def _elements_to_rows(elements, canvas_w, canvas_h):
+    """Shared post-processing: turn raw JS_EXTRACT elements into the
+    deduplicated container list used everywhere else (containers +
+    inner-text font matching). Factored out of analyze_html so both the
+    single-page and multi-page paths use identical logic."""
     containers = [e for e in elements if (e["hasBg"] or e["hasBorder"]) and e["tag"] != "body"]
     texts = [e for e in elements if e["text"]]
 
-    # De-duplicate nested containers with (near) identical bbox — keep the
-    # outermost one, since that's almost always the "visual" the designer
-    # actually placed.
     def is_nested_dup(a, b):
-        # b's box fully inside a's box, and areas are close (b is a's wrapper child)
         inside = (b["x"] >= a["x"] - 2 and b["y"] >= a["y"] - 2 and
                   b["x"] + b["w"] <= a["x"] + a["w"] + 2 and
                   b["y"] + b["h"] <= a["y"] + a["h"] + 2)
@@ -189,10 +286,13 @@ def analyze_html(path, canvas_w, canvas_h, screenshot_path=None):
         kept.append(c)
 
     kept.sort(key=lambda e: (e["y"], e["x"]))
+    return kept, texts
+
+
+def _build_rows_from_containers(kept, texts, canvas_w, canvas_h, detected_w, detected_h):
     rows = []
     for i, c in enumerate(kept, 1):
         bg_hex = rgb_to_hex(c["bg"]["r"], c["bg"]["g"], c["bg"]["b"]) if c["bg"] else ""
-        # find text elements that live inside this container to report font info
         inner_texts = [t for t in texts if
                         t["x"] >= c["x"] - 2 and t["y"] >= c["y"] - 2 and
                         t["x"] + t["w"] <= c["x"] + c["w"] + 2 and
@@ -223,8 +323,48 @@ def analyze_html(path, canvas_w, canvas_h, screenshot_path=None):
             "note": overflow_note,
         })
 
-    canvas = {"w": canvas_w, "h": canvas_h, "detected_w": data["page"]["w"], "detected_h": data["page"]["h"]}
+    canvas = {"w": canvas_w, "h": canvas_h, "detected_w": detected_w, "detected_h": detected_h}
     return canvas, rows
+
+
+def detect_html_canvas_size(path, probe_width=1280, probe_height=900):
+    """Render once at a generous probe viewport and read back the page's
+    real content size (body.offsetWidth/offsetHeight). Works for both
+    fixed-size dashboards (canvas == the probe size, unchanged) and tall,
+    naturally-scrolling report pages (canvas height grows to fit the real
+    content)."""
+    from playwright.sync_api import sync_playwright
+
+    abs_path = os.path.abspath(path)
+    url = f"file://{abs_path}"
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": probe_width, "height": probe_height})
+        page.goto(url)
+        page.wait_for_timeout(300)
+        dims = page.evaluate("() => ({w: document.body.offsetWidth, h: document.body.offsetHeight})")
+        browser.close()
+    return dims["w"], dims["h"]
+
+
+def analyze_html(path, canvas_w, canvas_h, screenshot_path=None):
+    from playwright.sync_api import sync_playwright
+
+    abs_path = os.path.abspath(path)
+    url = f"file://{abs_path}"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": canvas_w, "height": canvas_h})
+        page.goto(url)
+        page.wait_for_timeout(300)  # let fonts/layout settle
+        data = page.evaluate(JS_EXTRACT)
+        if screenshot_path:
+            page.screenshot(path=screenshot_path)
+        browser.close()
+
+    kept, texts = _elements_to_rows(data["elements"], canvas_w, canvas_h)
+    return _build_rows_from_containers(kept, texts, canvas_w, canvas_h, data["page"]["w"], data["page"]["h"])
 
 
 # ----------------------------------------------------------------------------
@@ -1572,15 +1712,22 @@ def _add_page_number_footer(doc):
     run._r.append(fld_end)
 
 
-def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_count=0, scale=1.0,
-                         hero_image_path=None, image_map=None, block_image_map=None):
+def generate_design_doc(pages, out_path, source_path, mode):
+    """pages: list of dicts, each with:
+         label (str or None -- None means "single page, no Page heading"),
+         canvas, sections, overflow_count, scale, hero_image_path,
+         image_map, block_image_map
+    A single-entry list with label=None renders identically to the
+    original single-page-only version of this function (no behavior
+    change for existing callers). 2+ entries (or a single entry with a
+    real label) render each under its own "N. Page Label" heading, with
+    every deeper heading level and numbering shifted to make room."""
     from docx import Document
     from docx.shared import Pt, Inches, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ROW_HEIGHT_RULE
 
-    image_map = image_map or {}
-    block_image_map = block_image_map or {}
+    multi_page = len(pages) > 1
     doc = Document()
 
     style = doc.styles["Normal"]
@@ -1588,9 +1735,15 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
     style.font.size = Pt(10.5)
     _add_page_number_footer(doc)
 
-    ACCENT, ACCENT_LIGHT = extract_theme(sections)
+    all_sections = [s for pg in pages for s in pg["sections"]]
+    first_canvas = pages[0]["canvas"]
+    first_hero = next((pg["hero_image_path"] for pg in pages if pg.get("hero_image_path")), None)
+    total_overflow = sum(pg.get("overflow_count", 0) for pg in pages)
+    pages_with_overflow = [pg for pg in pages if pg.get("overflow_count", 0)]
+
+    ACCENT, ACCENT_LIGHT = extract_theme(all_sections)
     accent_text_color = _readable_text_color(ACCENT)
-    palette = extract_palette(sections)
+    palette = extract_palette(all_sections)
 
     # tighten margins so the cover block reads as closer to full-bleed
     sec0 = doc.sections[0]
@@ -1635,28 +1788,35 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
 
     cover_para(space_before=18, space_after=2)
     cover_para("WIREFRAME DESIGN SPECIFICATION", size=30, bold=True, space_after=6)
-    cover_para("Layout, color & typography reference for Power BI rebuild", size=13, italic=True, space_after=24)
+    subtitle = f"{len(pages)} pages - " if multi_page else ""
+    cover_para(f"{subtitle}Layout, color & typography reference for Power BI rebuild", size=13, italic=True, space_after=24)
 
-    if hero_image_path and os.path.exists(hero_image_path):
+    if first_hero and os.path.exists(first_hero):
         hero_p = cover_para(space_after=4)
         hero_run = hero_p.add_run()
         try:
-            _add_fitted_picture(hero_run, hero_image_path, 5.6, 4.0)
+            _add_fitted_picture(hero_run, first_hero, 5.6, 4.0)
         except Exception:
             pass
-        cover_para("Full wireframe as analyzed", size=8.5, italic=True, space_after=20)
+        cap = f"'{pages[0]['label']}' page as analyzed" if pages[0].get("label") else "Full wireframe as analyzed"
+        cover_para(cap, size=8.5, italic=True, space_after=20)
     else:
         cover_para(space_after=20)
 
     # quick-stats strip
-    total_widgets = sum(len(s["widgets"]) for s in sections)
-    ratio = canvas["w"] / canvas["h"] if canvas["h"] else 0
+    total_sections = len(all_sections)
+    total_widgets = sum(len(s["widgets"]) for s in all_sections)
+    ratio = first_canvas["w"] / first_canvas["h"] if first_canvas["h"] else 0
     is_16_9 = abs(ratio - (16 / 9)) < 0.03
+    if multi_page:
+        stats_labels = ["Pages", "Sections", "Visuals Documented", "Canvas Size"]
+        stats_values = [str(len(pages)), str(total_sections), str(total_widgets), f"{first_canvas['w']} x {first_canvas['h']} px"]
+    else:
+        stats_labels = ["Sections", "Visuals Documented", "Canvas Size", "Aspect Ratio"]
+        stats_values = [str(total_sections), str(total_widgets), f"{first_canvas['w']} x {first_canvas['h']} px",
+                         f"{ratio:.3f}  ({'16:9' if is_16_9 else 'custom'})"]
     stats_table = cover_cell.add_table(rows=2, cols=4)
     stats_table.autofit = True
-    stats_labels = ["Sections", "Visuals Documented", "Canvas Size", "Aspect Ratio"]
-    stats_values = [str(len(sections)), str(total_widgets), f"{canvas['w']} x {canvas['h']} px",
-                     f"{ratio:.3f}  ({'16:9' if is_16_9 else 'custom'})"]
     for i in range(4):
         c1 = stats_table.rows[0].cells[i]
         c1.text = stats_labels[i]
@@ -1675,14 +1835,15 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
     cover_para(f"Source file: {os.path.basename(source_path)}   |   Mode: {mode}   |   "
                f"Generated: {__import__('datetime').date.today().isoformat()}", size=9, space_after=10)
 
-    if overflow_count:
-        cover_para(f"⚠ {overflow_count} visual(s) exceeded the canvas in raw detection — an auto-fit "
-                   f"scale of {scale:.1%} has been applied throughout this document so everything fits "
-                   f"on one page with no scrolling/clipping.", size=9, italic=True, space_after=10)
+    if total_overflow:
+        where = f" (on {len(pages_with_overflow)} of {len(pages)} pages)" if multi_page else ""
+        cover_para(f"[!] {total_overflow} visual(s) exceeded the canvas in raw detection{where}. "
+                   f"An auto-fit scale has been applied per-page so everything fits with no scrolling/clipping.",
+                   size=9, italic=True, space_after=10)
 
     if mode.startswith("Image"):
         cover_para("Generated from an image: positions/colors are estimated via computer vision and OCR, "
-                   "font family can't be detected from a flat image, visual descriptions are best-effort "
+                   "font family can't be detected from a flat image, visual descriptions below are best-effort "
                    "guesses, and a few tightly packed rows may be grouped together. Cross-check against "
                    "the source before finalizing.", size=8.5, italic=True, space_after=4)
 
@@ -1696,7 +1857,8 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
     toc_table = doc.add_table(rows=1, cols=3)
     toc_table.style = "Light Grid Accent 1"
     hdr = toc_table.rows[0].cells
-    for i, label in enumerate(["Section", "Visuals", "Dominant Color"]):
+    toc_headers = ["Page / Section", "Visuals", "Dominant Color"] if multi_page else ["Section", "Visuals", "Dominant Color"]
+    for i, label in enumerate(toc_headers):
         hdr[i].text = label
         hdr[i].paragraphs[0].runs[0].bold = True
         hdr[i].paragraphs[0].runs[0].font.size = Pt(11)
@@ -1707,27 +1869,41 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
     toc_table.rows[0].height = Inches(0.4)
     toc_table.rows[0].height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
 
-    for sec in sections:
+    def add_toc_row(name, widget_count, dom_color, bold=True, indent=False):
         row = toc_table.add_row()
-        row.height = Inches(0.45)
+        row.height = Inches(0.4 if indent else 0.45)
         row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
-        row.cells[0].text = sec["name"]
-        row.cells[0].paragraphs[0].runs[0].bold = True
-        row.cells[0].paragraphs[0].runs[0].font.size = Pt(12)
-        row.cells[1].text = f"{len(sec['widgets'])}"
+        row.cells[0].text = ("      " if indent else "") + name
+        row.cells[0].paragraphs[0].runs[0].bold = bold
+        row.cells[0].paragraphs[0].runs[0].font.size = Pt(10.5 if indent else 12)
+        if not indent:
+            _shade_cell(row.cells[0], ACCENT_LIGHT)
+        row.cells[1].text = str(widget_count)
         row.cells[1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-        row.cells[1].paragraphs[0].runs[0].font.size = Pt(12)
-        sec_colors = [w["bg_hex"] for w in sec["widgets"] if w.get("bg_hex")]
-        dom_color = Counter(sec_colors).most_common(1)[0][0] if sec_colors else ""
+        row.cells[1].paragraphs[0].runs[0].font.size = Pt(10.5 if indent else 12)
         if dom_color:
             row.cells[2].text = dom_color
             _shade_cell(row.cells[2], dom_color)
             row.cells[2].paragraphs[0].runs[0].font.color.rgb = _rgb_color(_readable_text_color(dom_color))
             row.cells[2].paragraphs[0].runs[0].bold = True
-            row.cells[2].paragraphs[0].runs[0].font.size = Pt(11)
+            row.cells[2].paragraphs[0].runs[0].font.size = Pt(10.5 if indent else 11)
         _set_cell_valign_center(row.cells[0])
         _set_cell_valign_center(row.cells[1])
         _set_cell_valign_center(row.cells[2])
+
+    def dominant_color_of(sec):
+        sec_colors = [w["bg_hex"] for w in sec["widgets"] if w.get("bg_hex")]
+        return Counter(sec_colors).most_common(1)[0][0] if sec_colors else ""
+
+    if multi_page:
+        for pg in pages:
+            pg_widget_total = sum(len(s["widgets"]) for s in pg["sections"])
+            add_toc_row(pg["label"] or "(untitled page)", pg_widget_total, "", bold=True, indent=False)
+            for sec in pg["sections"]:
+                add_toc_row(sec["name"], len(sec["widgets"]), dominant_color_of(sec), bold=False, indent=True)
+    else:
+        for sec in all_sections:
+            add_toc_row(sec["name"], len(sec["widgets"]), dominant_color_of(sec), bold=True, indent=False)
 
     doc.add_paragraph()
     palette_heading = doc.add_heading("Detected Color Palette", level=2)
@@ -1735,7 +1911,7 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
         run.font.color.rgb = _rgb_color(ACCENT)
     palette_note = doc.add_paragraph()
     palette_note_run = palette_note.add_run(
-        "The most-used colors found across the wireframe — use these directly when building a matching "
+        "The most-used colors found across the wireframe - use these directly when building a matching "
         "custom theme in Power BI (View -> Themes -> Customize current theme)."
     )
     palette_note_run.italic = True
@@ -1767,6 +1943,7 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
     setup_note = doc.add_paragraph()
     setup_note_run = setup_note.add_run(
         "Recommended starting settings so the report canvas matches this wireframe before you place visuals."
+        + (" Sizes shown are for the first page -- check each page's own Canvas Size if they differ." if multi_page else "")
     )
     setup_note_run.italic = True
     setup_note_run.font.size = Pt(10)
@@ -1794,133 +1971,157 @@ def generate_design_doc(canvas, sections, out_path, source_path, mode, overflow_
         _set_cell_valign_center(row.cells[0])
         _set_cell_valign_center(row.cells[1])
 
-    setup_row("Page Size (Custom)", f"{canvas['w']/96:.2f}\" x {canvas['h']/96:.2f}\"   ({canvas['w']} x {canvas['h']} px)")
+    setup_row("Page Size (Custom)", f"{first_canvas['w']/96:.2f}\" x {first_canvas['h']/96:.2f}\"   ({first_canvas['w']} x {first_canvas['h']} px)")
     setup_row("Page Background", ACCENT_LIGHT if brightness_of(ACCENT_LIGHT) > 200 else "#FFFFFF")
     setup_row("Primary / Accent Color", f"#{ACCENT}", swatch=f"#{ACCENT}")
-    setup_row("Suggested Font", "Segoe UI (Power BI default) — verify against source" if mode.startswith("Image") else "See each visual's Font Family below")
+    setup_row("Suggested Font", "Segoe UI (Power BI default) - verify against source" if mode.startswith("Image") else "See each visual's Font Family below")
     setup_row("Grid / Snap", "Enable snap-to-grid at a fine interval (e.g. 4-8 px) for pixel-accurate placement")
 
     doc.add_page_break()
 
+    # ---------------- Section-by-section detail, per page ----------------
+    def render_sections(sections, level_offset, numbering_prefix):
+        for s_idx, sec in enumerate(sections, 1):
+            sec_number = f"{numbering_prefix}{s_idx}"
+            sec_heading = doc.add_heading(f"{sec_number}. {sec['name']}", level=1 + level_offset)
+            for run in sec_heading.runs:
+                run.font.color.rgb = _rgb_color(ACCENT)
+            _add_bottom_border(sec_heading, color=ACCENT, size=16)
 
-    # ---------------- Section-by-section detail ----------------
-    for s_idx, sec in enumerate(sections, 1):
-        sec_heading = doc.add_heading(f"{s_idx}. {sec['name']}", level=1)
-        for run in sec_heading.runs:
-            run.font.color.rgb = _rgb_color(ACCENT)
-        _add_bottom_border(sec_heading, color=ACCENT, size=16)
+            count_p = doc.add_paragraph()
+            count_run = count_p.add_run(f"{len(sec['widgets'])} visual(s) detected in this section.")
+            count_run.italic = True
+            count_run.font.size = Pt(9.5)
+            count_run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
 
-        count_p = doc.add_paragraph()
-        count_run = count_p.add_run(f"{len(sec['widgets'])} visual(s) detected in this section.")
-        count_run.italic = True
-        count_run.font.size = Pt(9.5)
-        count_run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+            def make_table():
+                t = doc.add_table(rows=0, cols=2)
+                t.style = "Light Grid Accent 1"
+                t.alignment = WD_TABLE_ALIGNMENT.LEFT
+                t.columns[0].width = Inches(1.9)
+                t.columns[1].width = Inches(4.3)
+                return t
 
-        def make_table():
-            t = doc.add_table(rows=0, cols=2)
-            t.style = "Light Grid Accent 1"
-            t.alignment = WD_TABLE_ALIGNMENT.LEFT
-            t.columns[0].width = Inches(1.9)
-            t.columns[1].width = Inches(4.3)
-            return t
-
-        def add_row(table, prop, value, color_swatch=None):
-            row = table.add_row()
-            row.cells[0].text = prop
-            row.cells[0].paragraphs[0].runs[0].bold = True
-            _shade_cell(row.cells[0], ACCENT_LIGHT)
-            if color_swatch:
-                row.cells[1].text = value
-                _shade_cell(row.cells[1], color_swatch)
-                run = row.cells[1].paragraphs[0].runs[0]
-                run.font.color.rgb = _rgb_color(_readable_text_color(color_swatch))
-                run.bold = True
-            else:
-                row.cells[1].text = value
-
-        def render_visual(numbering, w, indent=False):
-            heading_level = 3 if indent else 2
-            prefix = "\u2192  " if indent else ""
-            visual_heading = doc.add_heading(f"{numbering}  {prefix}{w['title']}", level=heading_level)
-            for run in visual_heading.runs:
-                run.font.color.rgb = RGBColor(0x2E, 0x50, 0x90)
-
-            img_path = image_map.get(w.get("uid"))
-            if img_path and os.path.exists(img_path):
-                img_p = doc.add_paragraph()
-                img_run = img_p.add_run()
-                try:
-                    _add_fitted_picture(img_run, img_path, 2.3 if indent else 2.6, 3.0)
-                except Exception:
-                    pass
-
-            desc_p = doc.add_paragraph()
-            desc_run = desc_p.add_run(describe_visual(sec["name"], w))
-            desc_run.italic = True
-            desc_run.font.size = Pt(9.5)
-            desc_run.font.color.rgb = RGBColor(0x45, 0x45, 0x45)
-
-            table = make_table()
-            add_row(table, "Position (X, Y)", f"{w['x']} px, {w['y']} px   ({w['x_pt']} pt, {w['y_pt']} pt)")
-            add_row(table, "Dimensions (W x H)", f"{w['w']} x {w['h']} px   ({w['w_pt']} x {w['h_pt']} pt)")
-            if not w.get("block_uid") and w.get("bg_hex"):
-                add_row(table, "Background Color", w["bg_hex"], color_swatch=w["bg_hex"])
-            if w.get("font_family"):
-                add_row(table, "Font Family", w["font_family"])
-            if w.get("font_size_px") not in ("", None):
-                add_row(table, "Font Size", f"{w['font_size_px']} px  ({w.get('font_size_pt', '')} pt)")
-            if w.get("font_color_hex"):
-                add_row(table, "Font Color", w["font_color_hex"], color_swatch=w["font_color_hex"])
-            doc.add_paragraph()
-
-        # group this section's widgets by shared background block, preserving order
-        groups = []  # list of (block_uid_or_None, [widgets])
-        group_index_by_buid = {}
-        for w in sec["widgets"]:
-            buid = w.get("block_uid")
-            if buid:
-                if buid in group_index_by_buid:
-                    groups[group_index_by_buid[buid]][1].append(w)
-                else:
-                    group_index_by_buid[buid] = len(groups)
-                    groups.append((buid, [w]))
-            else:
-                groups.append((None, [w]))
-
-        block_num = 0
-        for buid, group_widgets in groups:
-            if buid:
-                block_num += 1
-                rep = group_widgets[0]
-                override = next((w.get("_block_title_override") for w in group_widgets if w.get("_block_title_override")), None)
-                block_title = override or rep["title"]
-                block_heading = doc.add_heading(f"{s_idx}.{block_num}  BLOCK: {block_title}", level=2)
-                for run in block_heading.runs:
-                    run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+            def add_row(table, prop, value, color_swatch=None):
+                row = table.add_row()
+                row.cells[0].text = prop
+                row.cells[0].paragraphs[0].runs[0].bold = True
+                _shade_cell(row.cells[0], ACCENT_LIGHT)
+                if color_swatch:
+                    row.cells[1].text = value
+                    _shade_cell(row.cells[1], color_swatch)
+                    run = row.cells[1].paragraphs[0].runs[0]
+                    run.font.color.rgb = _rgb_color(_readable_text_color(color_swatch))
                     run.bold = True
+                else:
+                    row.cells[1].text = value
 
-                block_img = block_image_map.get(buid)
-                if block_img and os.path.exists(block_img):
-                    bimg_p = doc.add_paragraph()
-                    bimg_run = bimg_p.add_run()
+            def render_visual(numbering, w, indent=False):
+                heading_level = (3 if indent else 2) + level_offset
+                prefix = "->  " if indent else ""
+                visual_heading = doc.add_heading(f"{numbering}  {prefix}{w['title']}", level=heading_level)
+                for run in visual_heading.runs:
+                    run.font.color.rgb = RGBColor(0x2E, 0x50, 0x90)
+
+                img_path = image_map.get(w.get("uid"))
+                if img_path and os.path.exists(img_path):
+                    img_p = doc.add_paragraph()
+                    img_run = img_p.add_run()
                     try:
-                        _add_fitted_picture(bimg_run, block_img, 3.4, 4.5)
+                        _add_fitted_picture(img_run, img_path, 2.3 if indent else 2.6, 3.0)
                     except Exception:
                         pass
 
-                block_table = make_table()
-                add_row(block_table, "Position (X, Y)", f"{rep['bg_x']} px, {rep['bg_y']} px   ({rep['bg_x_pt']} pt, {rep['bg_y_pt']} pt)")
-                add_row(block_table, "Dimensions (W x H)", f"{rep['bg_w']} x {rep['bg_h']} px   ({rep['bg_w_pt']} x {rep['bg_h_pt']} pt)")
-                if rep.get("bg_hex"):
-                    add_row(block_table, "Background Color", rep["bg_hex"], color_swatch=rep["bg_hex"])
+                desc_p = doc.add_paragraph()
+                desc_run = desc_p.add_run(describe_visual(sec["name"], w))
+                desc_run.italic = True
+                desc_run.font.size = Pt(9.5)
+                desc_run.font.color.rgb = RGBColor(0x45, 0x45, 0x45)
+
+                table = make_table()
+                add_row(table, "Position (X, Y)", f"{w['x']} px, {w['y']} px   ({w['x_pt']} pt, {w['y_pt']} pt)")
+                add_row(table, "Dimensions (W x H)", f"{w['w']} x {w['h']} px   ({w['w_pt']} x {w['h_pt']} pt)")
+                if not w.get("block_uid") and w.get("bg_hex"):
+                    add_row(table, "Background Color", w["bg_hex"], color_swatch=w["bg_hex"])
+                if w.get("font_family"):
+                    add_row(table, "Font Family", w["font_family"])
+                if w.get("font_size_px") not in ("", None):
+                    add_row(table, "Font Size", f"{w['font_size_px']} px  ({w.get('font_size_pt', '')} pt)")
+                if w.get("font_color_hex"):
+                    add_row(table, "Font Color", w["font_color_hex"], color_swatch=w["font_color_hex"])
                 doc.add_paragraph()
 
-                for v_idx, w in enumerate(group_widgets, 1):
-                    render_visual(f"{s_idx}.{block_num}.{v_idx}", w, indent=True)
-            else:
-                for w in group_widgets:
+            groups = []  # list of (block_uid_or_None, [widgets])
+            group_index_by_buid = {}
+            for w in sec["widgets"]:
+                buid = w.get("block_uid")
+                if buid:
+                    if buid in group_index_by_buid:
+                        groups[group_index_by_buid[buid]][1].append(w)
+                    else:
+                        group_index_by_buid[buid] = len(groups)
+                        groups.append((buid, [w]))
+                else:
+                    groups.append((None, [w]))
+
+            block_num = 0
+            for buid, group_widgets in groups:
+                if buid:
                     block_num += 1
-                    render_visual(f"{s_idx}.{block_num}", w, indent=False)
+                    rep = group_widgets[0]
+                    override = next((w.get("_block_title_override") for w in group_widgets if w.get("_block_title_override")), None)
+                    block_title = override or rep["title"]
+                    block_heading = doc.add_heading(f"{sec_number}.{block_num}  BLOCK: {block_title}", level=2 + level_offset)
+                    for run in block_heading.runs:
+                        run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+                        run.bold = True
+
+                    block_img = block_image_map.get(buid)
+                    if block_img and os.path.exists(block_img):
+                        bimg_p = doc.add_paragraph()
+                        bimg_run = bimg_p.add_run()
+                        try:
+                            _add_fitted_picture(bimg_run, block_img, 3.4, 4.5)
+                        except Exception:
+                            pass
+
+                    block_table = make_table()
+                    add_row(block_table, "Position (X, Y)", f"{rep['bg_x']} px, {rep['bg_y']} px   ({rep['bg_x_pt']} pt, {rep['bg_y_pt']} pt)")
+                    add_row(block_table, "Dimensions (W x H)", f"{rep['bg_w']} x {rep['bg_h']} px   ({rep['bg_w_pt']} x {rep['bg_h_pt']} pt)")
+                    if rep.get("bg_hex"):
+                        add_row(block_table, "Background Color", rep["bg_hex"], color_swatch=rep["bg_hex"])
+                    doc.add_paragraph()
+
+                    for v_idx, w in enumerate(group_widgets, 1):
+                        render_visual(f"{sec_number}.{block_num}.{v_idx}", w, indent=True)
+                else:
+                    for w in group_widgets:
+                        block_num += 1
+                        render_visual(f"{sec_number}.{block_num}", w, indent=False)
+
+    for p_idx, pg in enumerate(pages, 1):
+        image_map = pg.get("image_map") or {}
+        block_image_map = pg.get("block_image_map") or {}
+
+        if multi_page:
+            page_heading = doc.add_heading(f"{p_idx}. {pg['label'] or f'Page {p_idx}'}", level=1)
+            page_heading.paragraph_format.page_break_before = (p_idx > 1)
+            for run in page_heading.runs:
+                run.font.color.rgb = _rgb_color(ACCENT)
+                run.bold = True
+            _add_bottom_border(page_heading, color=ACCENT, size=24)
+            page_widget_total = sum(len(s["widgets"]) for s in pg["sections"])
+            pg_count_p = doc.add_paragraph()
+            pg_count_run = pg_count_p.add_run(
+                f"Canvas: {pg['canvas']['w']} x {pg['canvas']['h']} px   |   "
+                f"{len(pg['sections'])} section(s), {page_widget_total} visual(s) total."
+            )
+            pg_count_run.italic = True
+            pg_count_run.font.size = Pt(10)
+            pg_count_run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+            render_sections(pg["sections"], level_offset=1, numbering_prefix=f"{p_idx}.")
+        else:
+            render_sections(pg["sections"], level_offset=0, numbering_prefix="")
 
     doc.save(out_path)
     return out_path
@@ -2102,6 +2303,41 @@ def scale_sections(sections, scale):
 # Main
 # ----------------------------------------------------------------------------
 
+def _process_page(canvas, rows, text_rows, is_html, screenshot_path, work_dir, no_images, label=None):
+    """Run the full sections/blocks/visuals pipeline for one page's worth
+    of extracted rows, returning a dict ready to hand to generate_design_doc."""
+    scale, _ = fit_to_canvas(canvas, rows)
+    overflow_count = len([r for r in rows if r["note"]])
+
+    original_sections = build_sections(canvas, rows, text_rows, already_widgets=is_html)
+    if is_html:
+        original_sections = resolve_html_nesting(original_sections)
+    else:
+        original_sections = merge_overlapping_blocks(original_sections)
+        original_sections = merge_same_block_fragments(original_sections)
+    original_sections = dedupe_cross_section_blocks(original_sections)
+    assign_block_groups(original_sections)
+
+    image_map = {}
+    block_image_map = {}
+    if not no_images and screenshot_path:
+        image_map = crop_widget_images(screenshot_path, original_sections, work_dir, canvas)
+        block_image_map = crop_block_images(screenshot_path, original_sections, work_dir, canvas)
+
+    sections = scale_sections(original_sections, scale)
+
+    return {
+        "label": label,
+        "canvas": canvas,
+        "sections": sections,
+        "overflow_count": overflow_count,
+        "scale": scale,
+        "hero_image_path": screenshot_path,
+        "image_map": image_map,
+        "block_image_map": block_image_map,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description="Analyze a wireframe (HTML or image) and produce a professional design specification document.")
     ap.add_argument("input", help="Path to .html/.htm file or .png/.jpg/.jpeg image")
@@ -2111,8 +2347,9 @@ def main():
     ap.add_argument("--out", default=None, help="Exact output .docx path. Overrides --outdir/auto-naming if given.")
     ap.add_argument("--outdir", default=None, help="Folder to write the output into, using the auto-generated "
                     "name <input>_design_spec.docx. Created if it doesn't exist. Ignored if --out is given.")
-    ap.add_argument("--xlsx", action="store_true", help="Also generate the old-style Excel spec sheet alongside the design document")
+    ap.add_argument("--xlsx", action="store_true", help="Also generate the old-style Excel spec sheet alongside the design document (single-page documents only)")
     ap.add_argument("--no-images", action="store_true", help="Skip embedding cropped screenshots of each visual (faster, smaller file)")
+    ap.add_argument("--no-multipage", action="store_true", help="Disable automatic multi-page/tab detection for HTML -- always treat the file as a single page")
     args = ap.parse_args()
 
     if not os.path.isfile(args.input):
@@ -2128,7 +2365,7 @@ def main():
         cw, ch = detect_html_canvas_size(args.input)
         print(f"Auto-detected canvas size: {cw} x {ch} px")
     else:
-        cw, ch = 1280, 720  # unused for image mode (real image dimensions are read directly), harmless default
+        cw, ch = 1280, 720  # unused for image mode (real image dimensions are read directly)
 
     if args.out:
         out_path = args.out
@@ -2141,13 +2378,24 @@ def main():
     work_dir = os.path.splitext(out_path)[0] + "_assets"
 
     text_rows = None
+    pages_data = None  # set if multi-page HTML detected
     screenshot_path = None
+
     if is_html:
         mode = "HTML (exact)"
-        if not args.no_images:
-            os.makedirs(work_dir, exist_ok=True)
-            screenshot_path = os.path.join(work_dir, "_full_page.png")
-        canvas, rows = analyze_html(args.input, cw, ch, screenshot_path=screenshot_path)
+        if not args.no_multipage:
+            probe_work_dir = work_dir if not args.no_images else None
+            pages_data = detect_and_extract_pages(args.input, cw, ch, work_dir=probe_work_dir)
+
+        if pages_data:
+            print(f"Detected {len(pages_data)} pages (tabs) in this HTML file:")
+            for pd in pages_data:
+                print(f"  - {pd['label']}")
+        else:
+            if not args.no_images:
+                os.makedirs(work_dir, exist_ok=True)
+                screenshot_path = os.path.join(work_dir, "_full_page.png")
+            canvas, rows = analyze_html(args.input, cw, ch, screenshot_path=screenshot_path)
     elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
         mode = "Image (estimated)"
         canvas, rows, text_rows = analyze_image(args.input, cw, ch)
@@ -2156,48 +2404,37 @@ def main():
         print(f"Unsupported file type: {ext}. Use .html/.htm or .png/.jpg/.jpeg")
         sys.exit(1)
 
-    scale, _ = fit_to_canvas(canvas, rows)
-    overflow_count = len([r for r in rows if r["note"]])
-
-    # Build sections from ORIGINAL (unscaled) coordinates first -- these are
-    # what line up with the screenshot for cropping -- then scale a copy for
-    # the numbers shown in the document.
-    original_sections = build_sections(canvas, rows, text_rows, already_widgets=is_html)
-    if is_html:
-        original_sections = resolve_html_nesting(original_sections)
+    if pages_data:
+        pages = [_process_page(pd["canvas"], pd["rows"], None, True, pd["screenshot_path"],
+                                work_dir, args.no_images, label=pd["label"])
+                 for pd in pages_data]
     else:
-        original_sections = merge_overlapping_blocks(original_sections)
-        original_sections = merge_same_block_fragments(original_sections)
-    original_sections = dedupe_cross_section_blocks(original_sections)
-    assign_block_groups(original_sections)
+        pages = [_process_page(canvas, rows, text_rows, is_html, screenshot_path,
+                                work_dir, args.no_images, label=None)]
 
-    image_map = {}
-    block_image_map = {}
-    if not args.no_images and screenshot_path:
-        image_map = crop_widget_images(screenshot_path, original_sections, work_dir, canvas)
-        block_image_map = crop_block_images(screenshot_path, original_sections, work_dir, canvas)
+    generate_design_doc(pages, out_path, args.input, mode)
 
-    sections = scale_sections(original_sections, scale)
-
-    generate_design_doc(canvas, sections, out_path, args.input, mode, overflow_count=overflow_count,
-                         scale=scale, hero_image_path=screenshot_path, image_map=image_map,
-                         block_image_map=block_image_map)
-
-    total_widgets = sum(len(s["widgets"]) for s in sections)
+    total_sections = sum(len(pg["sections"]) for pg in pages)
+    total_widgets = sum(len(s["widgets"]) for pg in pages for s in pg["sections"])
+    total_overflow = sum(pg["overflow_count"] for pg in pages)
     print(f"\nMode: {mode}")
-    print(f"Canvas: {canvas['w']} x {canvas['h']} px  (aspect {canvas['w']/canvas['h']:.3f})")
-    print(f"Sections detected: {len(sections)}  ({', '.join(s['name'] for s in sections)})")
+    if len(pages) > 1:
+        print(f"Pages documented: {len(pages)}")
+    print(f"Sections detected: {total_sections}")
     print(f"Total visuals documented: {total_widgets}")
-    if overflow_count:
-        print(f"⚠️  {overflow_count} visual(s) exceeded the canvas in raw detection — auto-fit scale {scale:.1%} applied throughout the document.")
+    if total_overflow:
+        print(f"[!] {total_overflow} visual(s) exceeded the canvas in raw detection across the document -- auto-fit scale applied per page.")
     else:
-        print("Everything already fits within the canvas — no scaling needed.")
+        print("Everything already fits within its canvas -- no scaling needed.")
     print(f"Design document written to: {out_path}")
 
     if args.xlsx:
-        xlsx_path = os.path.splitext(out_path)[0] + ".xlsx"
-        write_report(canvas, rows, xlsx_path, args.input, mode, text_rows=text_rows)
-        print(f"Excel spec sheet also written to: {xlsx_path}")
+        if pages_data:
+            print("Note: --xlsx is only supported for single-page documents; skipping Excel export for this multi-page file.")
+        else:
+            xlsx_path = os.path.splitext(out_path)[0] + ".xlsx"
+            write_report(canvas, rows, xlsx_path, args.input, mode, text_rows=text_rows)
+            print(f"Excel spec sheet also written to: {xlsx_path}")
 
 
 if __name__ == "__main__":
