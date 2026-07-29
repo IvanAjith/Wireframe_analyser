@@ -1712,6 +1712,47 @@ def _add_page_number_footer(doc):
     run._r.append(fld_end)
 
 
+def _add_bookmark(paragraph, name):
+    """Mark this paragraph so a PAGEREF field elsewhere can resolve to
+    whatever physical page it lands on once Word/LibreOffice lays out the
+    document."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), str(abs(hash(name)) % 100000))
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), str(abs(hash(name)) % 100000))
+    paragraph._p.insert(0, start)
+    paragraph._p.append(end)
+
+
+def _add_pageref_field(paragraph, bookmark_name):
+    """Insert a PAGEREF field run -- resolves to the real page number of
+    the matching bookmark when the document is opened/converted (both Word
+    and LibreOffice update these fields automatically on open)."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    run = paragraph.add_run()
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = f'PAGEREF {bookmark_name} \\h'
+    fld_separate = OxmlElement("w:fldChar")
+    fld_separate.set(qn("w:fldCharType"), "separate")
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "?"
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_separate)
+    run._r.append(placeholder)
+    run._r.append(fld_end)
+    return run
+
+
 def generate_design_doc(pages, out_path, source_path, mode):
     """pages: list of dicts, each with:
          label (str or None -- None means "single page, no Page heading"),
@@ -1853,6 +1894,30 @@ def generate_design_doc(pages, out_path, source_path, mode):
     for run in contents_heading.runs:
         run.font.color.rgb = _rgb_color(ACCENT)
     _add_bottom_border(contents_heading, color=ACCENT, size=16)
+
+    if multi_page:
+        index_note = doc.add_paragraph()
+        index_note_run = index_note.add_run("Page Index")
+        index_note_run.bold = True
+        index_note_run.font.size = Pt(13)
+        index_note_run.font.color.rgb = _rgb_color(ACCENT)
+
+        index_table = doc.add_table(rows=0, cols=2)
+        index_table.style = "Light Grid Accent 1"
+        index_table.columns[0].width = Inches(5.0)
+        index_table.columns[1].width = Inches(1.2)
+        for p_idx, pg in enumerate(pages, 1):
+            row = index_table.add_row()
+            row.cells[0].text = f"{p_idx}. {pg['label'] or f'Page {p_idx}'}"
+            row.cells[0].paragraphs[0].runs[0].bold = True
+            row.cells[0].paragraphs[0].runs[0].font.size = Pt(11)
+            row.cells[1].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pageref_run = _add_pageref_field(row.cells[1].paragraphs[0], f"page_{p_idx}")
+            pageref_run.font.bold = True
+            pageref_run.font.size = Pt(11)
+            _set_cell_valign_center(row.cells[0])
+            _set_cell_valign_center(row.cells[1])
+        doc.add_paragraph()
 
     toc_table = doc.add_table(rows=1, cols=3)
     toc_table.style = "Light Grid Accent 1"
@@ -2106,12 +2171,17 @@ def generate_design_doc(pages, out_path, source_path, mode):
         if multi_page:
             page_heading = doc.add_heading(f"{p_idx}. {pg['label'] or f'Page {p_idx}'}", level=1)
             page_heading.paragraph_format.page_break_before = (p_idx > 1)
+            page_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
             for run in page_heading.runs:
                 run.font.color.rgb = _rgb_color(ACCENT)
                 run.bold = True
+                run.font.size = Pt(26)
             _add_bottom_border(page_heading, color=ACCENT, size=24)
+            _add_bookmark(page_heading, f"page_{p_idx}")
+
             page_widget_total = sum(len(s["widgets"]) for s in pg["sections"])
             pg_count_p = doc.add_paragraph()
+            pg_count_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             pg_count_run = pg_count_p.add_run(
                 f"Canvas: {pg['canvas']['w']} x {pg['canvas']['h']} px   |   "
                 f"{len(pg['sections'])} section(s), {page_widget_total} visual(s) total."
@@ -2119,6 +2189,26 @@ def generate_design_doc(pages, out_path, source_path, mode):
             pg_count_run.italic = True
             pg_count_run.font.size = Pt(10)
             pg_count_run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+
+            # full-page snapshot right up front, so anyone scrolling through
+            # the document can immediately see which page they're looking at
+            pg_hero = pg.get("hero_image_path")
+            if pg_hero and os.path.exists(pg_hero):
+                snap_p = doc.add_paragraph()
+                snap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                snap_run = snap_p.add_run()
+                try:
+                    _add_fitted_picture(snap_run, pg_hero, 6.2, 4.3)
+                except Exception:
+                    pass
+                snap_cap = doc.add_paragraph()
+                snap_cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                snap_cap_run = snap_cap.add_run(f"'{pg['label'] or f'Page {p_idx}'}' -- full page snapshot")
+                snap_cap_run.italic = True
+                snap_cap_run.font.size = Pt(8.5)
+                snap_cap_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+                doc.add_paragraph()
+
             render_sections(pg["sections"], level_offset=1, numbering_prefix=f"{p_idx}.")
         else:
             render_sections(pg["sections"], level_offset=0, numbering_prefix="")
