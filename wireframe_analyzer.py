@@ -78,12 +78,57 @@ JS_EXTRACT = r"""
 
   const results = [];
   const all = document.querySelectorAll('body, body *');
+  const idxMap = new Map();
+  all.forEach((el, i) => idxMap.set(el, i));
   all.forEach((el, idx) => {
     const rect = el.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 12) return; // skip tiny/invisible elements
+    if (rect.width < 20 || rect.height < 6) return; // skip tiny/invisible elements
+    const tagLower = el.tagName.toLowerCase();
+    const isSvgRoot = tagLower === 'svg';
+    // SVG internals are drawing primitives of ONE chart, not layout -- the
+    // <svg> root is captured as a single typed visual instead
+    if (!isSvgRoot && el.namespaceURI === 'http://www.w3.org/2000/svg') return;
+    if (isSvgRoot) {
+      const shapes = { polygon: 0, rect: 0, circle: 0, ellipse: 0, path: 0, line: 0 };
+      el.querySelectorAll('polygon,rect,circle,ellipse,path,line').forEach(s => {
+        const t = s.tagName.toLowerCase();
+        if (shapes[t] !== undefined) shapes[t]++;
+      });
+      const dataRects = Array.from(el.querySelectorAll('rect'))
+        .map(r => r.getBoundingClientRect()).filter(r => r.width >= 6 && r.height >= 6);
+      let svgType = 'custom', svgCount = 0;
+      if (shapes.polygon >= 2 && shapes.polygon >= dataRects.length) {
+        svgType = 'funnel'; svgCount = shapes.polygon;
+      } else if (dataRects.length >= 3) {
+        const ws = dataRects.map(r => r.width).sort((a, b) => a - b);
+        const hs = dataRects.map(r => r.height).sort((a, b) => a - b);
+        const wVar = (ws[ws.length - 1] - ws[0]) / Math.max(1, ws[ws.length - 1]);
+        const hVar = (hs[hs.length - 1] - hs[0]) / Math.max(1, hs[hs.length - 1]);
+        svgType = hVar > wVar ? 'column' : 'bar'; svgCount = dataRects.length;
+      } else if (shapes.circle + shapes.ellipse >= 1 && shapes.path <= 2) {
+        svgType = 'pie'; svgCount = shapes.circle + shapes.ellipse;
+      } else if (shapes.path >= 1) {
+        svgType = 'line'; svgCount = shapes.path;
+      }
+      let fnt = null;
+      const svgText = el.querySelector('text');
+      if (svgText) fnt = window.getComputedStyle(svgText);
+      results.push({
+        tag: 'svg', id: el.id || null, cls: null,
+        x: Math.round(rect.left + window.scrollX), y: Math.round(rect.top + window.scrollY),
+        w: Math.round(rect.width), h: Math.round(rect.height),
+        hasBg: false, hasBorder: false, bg: null, repeatKey: null,
+        text: '', svgType: svgType, svgCount: svgCount,
+        fontFamily: fnt ? fnt.fontFamily : '', fontSize: fnt ? parseFloat(fnt.fontSize) : 0,
+        fontWeight: fnt ? fnt.fontWeight : '', color: fnt ? parseColor(fnt.fill || fnt.color) : null,
+        borderRadius: '0px',
+      });
+      return;
+    }
     const cs = window.getComputedStyle(el);
     const bg = parseColor(cs.backgroundColor);
     const hasBg = bg && bg.a > 0.05;
+    if (rect.height < 12 && !hasBg) return; // 6-11px band: colored only (chart bars)
     const borderSides = [cs.borderTopWidth, cs.borderRightWidth, cs.borderBottomWidth, cs.borderLeftWidth]
       .map(v => parseFloat(v)).filter(v => v > 0).length;
     const hasBorder = borderSides >= 3; // a real box, not just a single divider line
@@ -99,8 +144,131 @@ JS_EXTRACT = r"""
 
     const color = parseColor(cs.color);
 
+    // repeatKey: marks this element as belonging to a run of >=3
+    // structurally-identical siblings (same parent + same first class, or
+    // tr/td/th/li tags) -- either the element itself is one of the run
+    // ('self'), or a thin row-like ANCESTOR of it is (typical HTML tables:
+    // the row divs are transparent, only the badges/cells inside them get
+    // captured). Everything sharing a runKey is the DATA of one visual --
+    // table rows, chart bars, list entries -- and gets collapsed into a
+    // single typed visual later instead of documented item by item.
+    const tagName = el.tagName.toLowerCase();
+    function runKey(node) {
+      const par = node.parentElement;
+      if (!par) return null;
+      if (node.className && typeof node.className === 'string') {
+        const cls = node.className.trim().split(/\s+/)[0];
+        if (cls) {
+          let same = 0;
+          for (const sib of par.children) {
+            if (sib.classList && sib.classList.contains(cls)) same++;
+          }
+          if (same >= 3) return (idxMap.has(par) ? idxMap.get(par) : -1) + ':' + cls;
+        }
+      }
+      // classless markup (inline-styled mockups): >=3 THIN same-tag sibling
+      // divs are a row-run too. Thin-only, so stacks of big layout wrappers
+      // or cards never merge.
+      const nr = node.getBoundingClientRect();
+      const classless = !((node.className || '').toString().trim());
+      if (classless && nr.height >= 8 && nr.height <= 45) {
+        let same = 0;
+        for (const sib of par.children) {
+          if (sib.tagName === node.tagName && !((sib.className || '').toString().trim())) {
+            const sr = sib.getBoundingClientRect();
+            if (sr.height >= 8 && sr.height <= 45) same++;
+          }
+        }
+        if (same >= 3) return (idxMap.has(par) ? idxMap.get(par) : -1) + ':thinrun';
+      }
+      // metric/KPI pairs: a wrapper whose ONLY children are 2 same-class,
+      // similar-size, small siblings (label+value metric pair, comparison
+      // pair). Small-only and exactly-2-only, so two-column page layouts
+      // never merge.
+      if (node.className && typeof node.className === 'string') {
+        const cls2 = node.className.trim().split(/\s+/)[0];
+        if (cls2 && par.children.length === 2) {
+          const sibs = Array.from(par.children);
+          if (sibs.every(s => s.classList && s.classList.contains(cls2))) {
+            const rA = sibs[0].getBoundingClientRect(), rB = sibs[1].getBoundingClientRect();
+            const pageArea = Math.max(1, document.body.offsetWidth * document.body.offsetHeight);
+            const small = r => (r.width * r.height) / pageArea <= 0.01 && r.height <= 90;
+            const similar = Math.abs(rA.width - rB.width) <= 0.15 * Math.max(rA.width, rB.width) &&
+                            Math.abs(rA.height - rB.height) <= 0.15 * Math.max(rA.height, rB.height);
+            if (small(rA) && small(rB) && similar) {
+              return (idxMap.has(par) ? idxMap.get(par) : -1) + ':@pair';
+            }
+          }
+        }
+      }
+      // classless equal-width sibling groups laid out side by side or as a
+      // grid (>=2 distinct x positions) = the clusters/tiles of ONE chart
+      // (quarter columns of a trend, stat tiles of a distribution...).
+      // Small-only (each <=3% of the page) so page sections never merge.
+      if (classless && nr.width >= 40) {
+        const pageArea = Math.max(1, document.body.offsetWidth * document.body.offsetHeight);
+        if (nr.width <= 0.5 * document.body.offsetWidth && (nr.width * nr.height) / pageArea <= 0.03) {
+          const matches = [];
+          for (const sib of par.children) {
+            if (sib.tagName !== node.tagName) continue;
+            if (((sib.className || '').toString().trim())) continue;
+            const sr = sib.getBoundingClientRect();
+            if (sr.width >= 40 && Math.abs(sr.width - nr.width) <= 0.25 * nr.width &&
+                (sr.width * sr.height) / pageArea <= 0.03) {
+              matches.push(Math.round(sr.left));
+            }
+          }
+          const distinctX = new Set(matches.map(x => Math.round(x / 24))).size;
+          if (matches.length >= 3 && distinctX >= 2) {
+            return (idxMap.has(par) ? idxMap.get(par) : -1) + ':@grp';
+          }
+        }
+      }
+      return null;
+    }
+    let repeatKey = null;
+    // real HTML tables/lists: EVERY row/cell of one <table> (or item of one
+    // <ul>/<ol>) belongs to the SAME visual -- key by the table itself, not
+    // by each row, or the group fragments into one-row slivers
+    if (['td', 'th', 'tr'].includes(tagName)) {
+      const tbl = el.closest('table');
+      if (tbl && tbl.querySelectorAll('tr').length >= 3) {
+        repeatKey = (idxMap.has(tbl) ? idxMap.get(tbl) : -1) + ':table';
+      }
+    } else if (tagName === 'li') {
+      const lst = el.closest('ul,ol');
+      if (lst && lst.querySelectorAll('li').length >= 3) {
+        repeatKey = (idxMap.has(lst) ? idxMap.get(lst) : -1) + ':list';
+      }
+    }
+    if (!repeatKey) repeatKey = runKey(el);
+    if (!repeatKey) {
+      // inherit from a thin, row-like repeated ancestor (h<=45 or w<=60) --
+      // big repeated cards (dashboard tiles) deliberately DON'T propagate,
+      // so their contents stay individually documented
+      let anc = el.parentElement;
+      for (let d = 0; d < 4 && anc && anc !== document.body; d++, anc = anc.parentElement) {
+        const at = anc.tagName.toLowerCase();
+        if (['td', 'th', 'tr'].includes(at)) {
+          const tbl = anc.closest('table');
+          if (tbl && tbl.querySelectorAll('tr').length >= 3) {
+            repeatKey = (idxMap.has(tbl) ? idxMap.get(tbl) : -1) + ':table';
+            break;
+          }
+        }
+        const ar = anc.getBoundingClientRect();
+        if (ar.height <= 45 || ar.width <= 60) {
+          const k = runKey(anc);
+          if (k) { repeatKey = k; break; }
+        } else {
+          const k = runKey(anc);
+          if (k && k.endsWith(':@grp')) { repeatKey = k; break; }
+        }
+      }
+    }
+
     results.push({
-      tag: el.tagName.toLowerCase(),
+      tag: tagName,
       id: el.id || null,
       cls: el.className && typeof el.className === 'string' ? el.className : null,
       x: Math.round(rect.left + window.scrollX),
@@ -109,6 +277,7 @@ JS_EXTRACT = r"""
       h: Math.round(rect.height),
       hasBg, hasBorder,
       bg: hasBg ? bg : null,
+      repeatKey: repeatKey,
       text: ownText.slice(0, 40),
       fontFamily: cs.fontFamily,
       fontSize: parseFloat(cs.fontSize),
@@ -191,6 +360,189 @@ JS_SHOW_ONLY = r"""
 }
 """
 
+JS_CLICK_NAV = r"""
+(args) => {
+  const { groupClass, targetId, targetIndex } = args;
+  const els = Array.from(document.getElementsByClassName(groupClass));
+  const target = targetId ? els.find(e => e.id === targetId) : els[targetIndex];
+  if (!target) return false;
+  const id = target.id || '';
+  const suffix = id.replace(/^(page|tab|view|section)[-_]?/i, '');
+  const candidates = document.querySelectorAll('[onclick], [data-target], [data-page], [href]');
+  for (const c of candidates) {
+    const blob = (c.getAttribute('onclick') || '') + ' ' + (c.getAttribute('data-target') || '') +
+                 ' ' + (c.getAttribute('data-page') || '') + ' ' + (c.getAttribute('href') || '');
+    if ((id && blob.includes(id)) || (suffix && suffix !== id && blob.includes(suffix))) {
+      c.click();
+      return true;
+    }
+  }
+  return false;
+}
+"""
+
+JS_EXPAND_TOGGLES = r"""
+(args) => {
+  const { groupClass, targetId, targetIndex } = args;
+  const els = Array.from(document.getElementsByClassName(groupClass));
+  const container = targetId ? els.find(e => e.id === targetId) : els[targetIndex];
+  if (!container) return 0;
+
+  function visCount() {
+    let n = 0;
+    container.querySelectorAll('*').forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width >= 20 && r.height >= 12) n++;
+    });
+    return n;
+  }
+
+  // small, button-sized clickables INSIDE this page only (never the shared
+  // nav/tab bar, which lives outside the page container)
+  const clickables = Array.from(
+    container.querySelectorAll('[onclick], [data-toggle], [data-target], [aria-expanded], button, summary')
+  ).filter(el => {
+    const r = el.getBoundingClientRect();
+    return r.width >= 10 && r.height >= 8 && r.width <= 420 && r.height <= 60;
+  });
+
+  let expanded = 0;
+  for (const el of clickables.slice(0, 15)) {
+    const before = visCount();
+    const beforeH = document.body.offsetHeight;
+    try { el.click(); } catch (e) { continue; }
+    const after = visCount();
+    const afterH = document.body.offsetHeight;
+    if (after > before || afterH > beforeH) {
+      expanded++;            // revealed new content -- keep it open
+    } else if (after < before || afterH < beforeH) {
+      try { el.click(); } catch (e) {}  // it collapsed/hid something -- undo
+    }
+  }
+  return expanded;
+}
+"""
+
+JS_IS_VISIBLE = r"""
+(args) => {
+  const { groupClass, targetId, targetIndex } = args;
+  const els = Array.from(document.getElementsByClassName(groupClass));
+  const target = targetId ? els.find(e => e.id === targetId) : els[targetIndex];
+  if (!target) return false;
+  const cs = window.getComputedStyle(target);
+  if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+  // and every sibling page must actually be hidden, or we'd extract a mix
+  return els.every(el => {
+    if (el === target) return true;
+    const s = window.getComputedStyle(el);
+    return s.display === 'none' || s.visibility === 'hidden';
+  });
+}
+"""
+
+
+def _norm_text(t):
+    return " ".join((t or "").split())
+
+
+def _rows_match(a, b, tol=3):
+    """Same element on two pages, allowing a few px of layout jitter.
+    Text and background must still match exactly (normalized whitespace)."""
+    return (abs(a["x"] - b["x"]) <= tol and abs(a["y"] - b["y"]) <= tol and
+            abs(a["w"] - b["w"]) <= tol + 1 and abs(a["h"] - b["h"]) <= tol + 1 and
+            a.get("bg_hex", "") == b.get("bg_hex", "") and
+            _norm_text(a.get("sample_text")) == _norm_text(b.get("sample_text")))
+
+
+def extract_common_elements(pages_data, canvas_w):
+    """Two-tier de-duplication of elements that repeat across pages:
+
+    Tier 1 (Common Elements section): rows that appear -- within a small
+    position tolerance, same bg + same text -- on EVERY page (the shared
+    header/nav/filter-bar "shell"). Removed from all pages, documented
+    once, with a cropped screenshot of the shell region.
+
+    Tier 2 (per-page notes): rows with real text that appear identically
+    on SOME (>= 2) pages but not all (per-page Export buttons, By-Factory
+    toggles, etc). They stay fully documented on the first page they occur
+    on; later pages drop them and instead get a one-line 'Also on this
+    page ...' note pointing back to where they're documented. This is what
+    stops the same filter/button being redocumented on page after page."""
+    if len(pages_data) < 2:
+        return pages_data, None
+
+    # ---- Tier 1: on every page (tolerance-based, not pixel-exact) ----
+    common_rows = []
+    removed_ids = set()  # id() of row objects to drop, per page
+    for r in pages_data[0]["rows"]:
+        matches = [r]
+        for pd in pages_data[1:]:
+            m = next((o for o in pd["rows"] if _rows_match(r, o)), None)
+            if m is None:
+                matches = None
+                break
+            matches.append(m)
+        if matches:
+            common_rows.append(r)
+            for m in matches:
+                removed_ids.add(id(m))
+
+    for pd in pages_data:
+        pd["rows"] = [r for r in pd["rows"] if id(r) not in removed_ids]
+
+    # ---- Tier 2: identical on >= 2 pages (but not all) ----------------
+    # Only rows with real text are deduped here: an empty container at the
+    # same spot on two pages can legitimately hold different content, so
+    # removing it would orphan that page's visuals.
+    for i, pd_src in enumerate(pages_data):
+        src_label = pd_src["label"] or f"Page {i + 1}"
+        for r in pd_src["rows"]:
+            if not _norm_text(r.get("sample_text")):
+                continue
+            for j in range(i + 1, len(pages_data)):
+                pd_dst = pages_data[j]
+                dups = [o for o in pd_dst["rows"] if _rows_match(r, o)]
+                if not dups:
+                    continue
+                dup_ids = {id(o) for o in dups}
+                pd_dst["rows"] = [o for o in pd_dst["rows"] if id(o) not in dup_ids]
+                notes = pd_dst.setdefault("_dedup_map", {})
+                notes.setdefault(src_label, []).append(_norm_text(r.get("sample_text"))[:30])
+
+    for pd in pages_data:
+        dmap = pd.pop("_dedup_map", None)
+        if dmap:
+            pd["dedup_notes"] = [
+                f"Also on this page, identical to '{src}' (see there for full details): " + ", ".join(titles)
+                for src, titles in dmap.items()
+            ]
+
+    if not common_rows:
+        return pages_data, None
+
+    shell_bottom = max(r["y"] + r["h"] for r in common_rows)
+    shell_canvas = {"w": canvas_w, "h": shell_bottom, "detected_w": canvas_w, "detected_h": shell_bottom}
+
+    shell_screenshot = None
+    first_screenshot = pages_data[0].get("screenshot_path")
+    if first_screenshot and os.path.exists(first_screenshot):
+        try:
+            from PIL import Image
+            with Image.open(first_screenshot) as im:
+                crop = im.crop((0, 0, canvas_w, min(shell_bottom + 4, im.height)))
+                shell_dir = os.path.dirname(first_screenshot)
+                shell_screenshot = os.path.join(shell_dir, "_common_shell.png")
+                crop.save(shell_screenshot)
+        except Exception:
+            shell_screenshot = None
+
+    return pages_data, {
+        "label": "Common Elements  (appear identically on every page)",
+        "canvas": shell_canvas,
+        "rows": common_rows,
+        "screenshot_path": shell_screenshot,
+    }
+
 
 def detect_and_extract_pages(path, canvas_w, canvas_h, work_dir=None):
     """If this HTML has multiple tab/page-style sections (several sibling
@@ -208,6 +560,7 @@ def detect_and_extract_pages(path, canvas_w, canvas_h, work_dir=None):
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": canvas_w, "height": canvas_h})
+        page.on("dialog", lambda d: d.dismiss())
         page.goto(url)
         page.wait_for_timeout(300)
 
@@ -218,12 +571,38 @@ def detect_and_extract_pages(path, canvas_w, canvas_h, work_dir=None):
 
         results = []
         for p_info in group["pages"]:
-            page.evaluate(JS_SHOW_ONLY, {
+            nav_args = {
                 "groupClass": group["groupClass"],
                 "targetId": p_info["id"],
                 "targetIndex": p_info["index"],
-            })
-            page.wait_for_timeout(150)
+            }
+            # Activate the page the way a real user would: click its nav
+            # button, so the wireframe's own JS updates BOTH the page
+            # visibility AND the tab bar's active styling (underline,
+            # highlight). Direct display-toggling alone leaves the tab bar
+            # stuck on whichever tab was active when the file was saved.
+            clicked = page.evaluate(JS_CLICK_NAV, nav_args)
+            if clicked:
+                page.wait_for_timeout(200)
+            if not page.evaluate(JS_IS_VISIBLE, nav_args):
+                # no clickable nav found, or clicking didn't switch pages --
+                # fall back to forcing visibility directly
+                page.evaluate(JS_SHOW_ONLY, nav_args)
+                page.wait_for_timeout(150)
+
+            # Click expander-style controls inside this page ('[+] By
+            # Factory' etc.) so tables/sections that only appear on click
+            # are open -- and therefore extracted + screenshotted -- too.
+            n_expanded = page.evaluate(JS_EXPAND_TOGGLES, nav_args)
+            if n_expanded:
+                page.wait_for_timeout(200)
+                print(f"  {p_info['label']}: expanded {n_expanded} collapsible section(s) before analysis")
+            if not page.evaluate(JS_IS_VISIBLE, nav_args):
+                # an expander click accidentally switched/hid the page --
+                # bring it back before extracting
+                if not page.evaluate(JS_CLICK_NAV, nav_args):
+                    page.evaluate(JS_SHOW_ONLY, nav_args)
+                page.wait_for_timeout(150)
 
             # this page's real content may be taller than the initial probe
             # viewport (each tab can have very different content length) --
@@ -262,12 +641,228 @@ def detect_and_extract_pages(path, canvas_w, canvas_h, work_dir=None):
     return results
 
 
+
+_SVG_TYPE_MAP = {
+    "funnel": ("Funnel", "Funnel"),
+    "bar": ("Bar chart (horizontal)", "Clustered bar chart"),
+    "column": ("Column chart (vertical)", "Clustered column chart"),
+    "pie": ("Pie / Donut chart", "Pie chart or Donut chart"),
+    "line": ("Line / Area chart", "Line chart or Area chart"),
+    "custom": ("Custom chart (SVG)", "Closest native chart visual, or a custom visual"),
+}
+
+def collapse_repeated_rows(rows, canvas_w, canvas_h):
+    """Collapse runs of repeated DOM siblings (same repeat_key) into ONE
+    synthetic visual, classified as the Power BI native visual it maps to.
+    A bar chart's 8 bars / a table's 12 rows are DATA, not layout -- the
+    spec only needs 'a Bar chart sits here, this big, this font', not one
+    entry per bar/row.
+
+    Classification (geometry of the repeated items):
+      - vertically stacked, similar heights, similar widths  -> Table rows
+        (narrow stacks with text read as a List / menu instead)
+      - vertically stacked, similar heights, VARYING widths, left-aligned
+                                                    -> Horizontal Bar chart
+      - side by side, similar widths, varying heights, bottom-aligned
+                                                    -> Column chart
+      - <tr>/<td>/<th>/<li> tags                    -> Table / List
+    Groups that don't match a pattern (e.g. a grid of big dashboard cards
+    that happen to share a class) are left fully itemized."""
+    from collections import OrderedDict
+
+    groups = OrderedDict()
+    singles = []
+    for r in rows:
+        k = r.get("repeat_key")
+        if k:
+            groups.setdefault(k, []).append(r)
+        else:
+            singles.append(r)
+
+    out = list(singles)
+    deferred_lists = []
+    next_id = max((r["id"] for r in rows), default=0)
+
+    def _y_levels(members):
+        cs = sorted(m["y"] + m["h"] / 2 for m in members)
+        levels, last = 0, None
+        for c in cs:
+            if last is None or c - last > 8:
+                levels += 1
+                last = c
+        return levels
+
+    def _wordy(m):
+        """True when the item carries WORD text (>=3 letters, more letters
+        than digits). Chart bars are textless or numeric ('38%'); colored
+        word-pills are status badges in a table -- their widths vary with
+        word length, which fakes the bar-chart geometry."""
+        t = _norm_text(m.get("sample_text"))
+        letters = sum(c.isalpha() for c in t)
+        digits = sum(c.isdigit() for c in t)
+        # narrow-only: a NARROW colored item sized to its word = a badge
+        # pill. A WIDE colored item is a real bar even when it carries a
+        # category label -- its width is data-driven, not text-driven.
+        return letters >= 3 and letters > digits and m["w"] < 140
+
+    def _bar_subcluster(members):
+        """>=3 colored, thin, left-aligned, textless/numeric items whose
+        widths vary = bars."""
+        from collections import defaultdict
+        byx = defaultdict(list)
+        for m in members:
+            if 6 <= m["h"] <= 30 and m.get("bg_hex") and not _wordy(m):
+                byx[round(m["x"] / 8)].append(m)
+        union_w = (max(m["x"] + m["w"] for m in members) -
+                   min(m["x"] for m in members)) if members else 1
+        for grp in byx.values():
+            if len(grp) < 3:
+                continue
+            hs = sorted(g["h"] for g in grp)
+            ws = sorted(g["w"] for g in grp)
+            # bars must DOMINATE the visual's width -- a bar chart's bars
+            # span most of the plot; narrow colored cells (numbers, accents,
+            # mini progress fills) inside a wide table never do
+            if ws[len(ws) // 2] < 0.25 * union_w:
+                continue
+            if (hs[-1] - hs[0]) <= max(6, 0.35 * hs[len(hs) // 2]) and \
+               (ws[-1] - ws[0]) / max(1.0, float(ws[-1])) > 0.18 and _y_levels(grp) >= 3:
+                return grp
+        return None
+
+    def _column_subcluster(members):
+        """>=3 thin, bottom-aligned items whose heights vary = columns."""
+        from collections import defaultdict
+        byb = defaultdict(list)
+        for m in members:
+            if m["w"] <= 50 and m.get("bg_hex") and not _wordy(m):
+                byb[round((m["y"] + m["h"]) / 8)].append(m)
+        for grp in byb.values():
+            if len(grp) < 3:
+                continue
+            ws = sorted(g["w"] for g in grp)
+            hs = sorted(g["h"] for g in grp)
+            if (ws[-1] - ws[0]) <= 8 and (hs[-1] - hs[0]) > 0.25 * hs[-1]:
+                return grp
+        return None
+
+    for key, members in groups.items():
+        min_members = 2 if key.endswith(":@pair") else 3
+        if len(members) < min_members:
+            out.extend(members)
+            continue
+        if key.endswith(":@pair"):
+            vtype = ("KPI / metric group", "Multi-row card")
+            # fall through to the union/synthetic build below
+        else:
+            vtype = None
+
+        def _text_column_count(members):
+            """Distinct x-aligned columns holding >=3 WORD-text items. A data
+            TABLE has 3+ such columns; a bar chart has at most 1-2 (category
+            labels, maybe a status column) -- its VALUE columns are numeric
+            and don't count, since numeric data labels are normal on charts.
+            This is the structural tiebreaker when a table contains bar-like
+            colored cells or a chart contains label text."""
+            from collections import defaultdict
+            cols = defaultdict(int)
+            for m in members:
+                t = _norm_text(m.get("sample_text"))
+                letters = sum(c.isalpha() for c in t)
+                digits = sum(c.isdigit() for c in t)
+                if letters >= 3 and letters > digits:
+                    cols[round(m["x"] / 12)] += 1
+            return sum(1 for n in cols.values() if n >= 3)
+
+        if vtype is None and _bar_subcluster(members) and _text_column_count(members) <= 2:
+            vtype = ("Bar chart (horizontal)", "Clustered bar chart")
+        elif vtype is None and _column_subcluster(members):
+            vtype = ("Column chart (vertical)", "Clustered column chart")
+        elif vtype is None and key.endswith(":@grp"):
+            # a run of equal-width classless sibling groups laid out side by
+            # side / in a grid = the clusters of ONE chart or stat-tile group
+            vtype = ("Chart / stat group", "Clustered bar or column chart (or Multi-row card)")
+        elif vtype is None:
+            # table / list: repetition down the page, and no member so tall
+            # that this could be a grid of real dashboard cards
+            max_h = max(m["h"] for m in members)
+            if max_h <= 60 and _y_levels(members) >= 3:
+                ux0 = min(m["x"] for m in members)
+                ux1 = max(m["x"] + m["w"] for m in members)
+                uy0 = min(m["y"] for m in members)
+                uy1 = max(m["y"] + m["h"] for m in members)
+                if (ux1 - ux0) >= 0.3 * canvas_w:
+                    vtype = ("Table", "Table / Matrix")
+                elif ux1 < 0.3 * canvas_w and (uy1 - uy0) > 0.25 * canvas_h:
+                    vtype = None  # tall narrow left-edge list = likely a nav menu; keep itemized
+                else:
+                    vtype = ("List / menu", "Table (or Buttons + bookmarks for navigation)")
+
+        if not vtype:
+            out.extend(members)
+            continue
+
+        ux0 = min(m["x"] for m in members)
+        uy0 = min(m["y"] for m in members)
+        ux1 = max(m["x"] + m["w"] for m in members)
+        uy1 = max(m["y"] + m["h"] for m in members)
+        font_src = next((m for m in members if m.get("font_family")), members[0])
+        bg_src = next((m for m in members if m.get("bg_hex")), None)
+        next_id += 1
+        synth = {
+            "id": next_id,
+            "tag": "chart",
+            "label": vtype[0][:30],
+            "x": ux0, "y": uy0, "w": ux1 - ux0, "h": uy1 - uy0,
+            "x_pt": px_to_pt(ux0), "y_pt": px_to_pt(uy0),
+            "w_pt": px_to_pt(ux1 - ux0), "h_pt": px_to_pt(uy1 - uy0),
+            "bg_hex": bg_src["bg_hex"] if bg_src else "",
+            "font_family": font_src.get("font_family", ""),
+            "font_size_px": font_src.get("font_size_px", ""),
+            "font_size_pt": font_src.get("font_size_pt", ""),
+            "font_color_hex": font_src.get("font_color_hex", ""),
+            "sample_text": vtype[0],
+            "repeat_key": None,
+            "visual_type": vtype[1],
+            "item_count": len(members),
+            "note": next((m["note"] for m in members if m.get("note")), ""),
+        }
+        if vtype[0] == "List / menu":
+            deferred_lists.append(synth)
+        else:
+            out.append(synth)
+
+    # A 'List / menu' has no native Power BI visual. When one sits INSIDE a
+    # documented container (a dashboard card), that block's own snapshot,
+    # position and font already cover it -- emitting it as a separate visual
+    # is redundant, so it's dropped entirely. Standalone lists (no enclosing
+    # element) are kept, so nothing is silently lost.
+    for synth in deferred_lists:
+        area = max(1, synth["w"] * synth["h"])
+        contained = False
+        for o in out:  # all kept rows, incl. members of unclassified runs (cards)
+            if o["w"] * o["h"] <= area:
+                continue
+            ix = max(0, min(synth["x"] + synth["w"], o["x"] + o["w"]) - max(synth["x"], o["x"]))
+            iy = max(0, min(synth["y"] + synth["h"], o["y"] + o["h"]) - max(synth["y"], o["y"]))
+            if ix * iy >= 0.7 * area:
+                contained = True
+                break
+        if not contained:
+            out.append(synth)
+
+    out.sort(key=lambda r: (r["y"], r["x"]))
+    for i, r in enumerate(out, 1):
+        r["id"] = i
+    return out
+
+
 def _elements_to_rows(elements, canvas_w, canvas_h):
     """Shared post-processing: turn raw JS_EXTRACT elements into the
     deduplicated container list used everywhere else (containers +
     inner-text font matching). Factored out of analyze_html so both the
     single-page and multi-page paths use identical logic."""
-    containers = [e for e in elements if (e["hasBg"] or e["hasBorder"]) and e["tag"] != "body"]
+    containers = [e for e in elements if (e["hasBg"] or e["hasBorder"] or e.get("svgType")) and e["tag"] != "body"]
     texts = [e for e in elements if e["text"]]
 
     def is_nested_dup(a, b):
@@ -281,7 +876,9 @@ def _elements_to_rows(elements, canvas_w, canvas_h):
     containers.sort(key=lambda e: e["w"] * e["h"], reverse=True)
     kept = []
     for c in containers:
-        if any(is_nested_dup(k, c) for k in kept):
+        # an <svg> filling most of its card is the card's CHART, not a
+        # duplicate box -- always keep it
+        if not c.get("svgType") and any(is_nested_dup(k, c) for k in kept):
             continue
         kept.append(c)
 
@@ -297,20 +894,25 @@ def _build_rows_from_containers(kept, texts, canvas_w, canvas_h, detected_w, det
                         t["x"] >= c["x"] - 2 and t["y"] >= c["y"] - 2 and
                         t["x"] + t["w"] <= c["x"] + c["w"] + 2 and
                         t["y"] + t["h"] <= c["y"] + c["h"] + 2]
-        font_family = inner_texts[0]["fontFamily"].split(",")[0].strip().strip('"') if inner_texts else ""
-        font_size_px = inner_texts[0]["fontSize"] if inner_texts else ""
-        font_color_hex = (rgb_to_hex(inner_texts[0]["color"]["r"], inner_texts[0]["color"]["g"], inner_texts[0]["color"]["b"])
-                           if inner_texts and inner_texts[0]["color"] else "")
-        sample_text = inner_texts[0]["text"] if inner_texts else ""
+        # title = first inner text containing alphanumerics; a leading icon
+        # (emoji, arrow, symbol-only text) makes a useless title like '🎯'
+        title_src = next((t for t in inner_texts if any(ch.isalnum() for ch in t["text"])),
+                          inner_texts[0] if inner_texts else None)
+        font_family = title_src["fontFamily"].split(",")[0].strip().strip('"') if title_src else ""
+        font_size_px = title_src["fontSize"] if title_src else ""
+        font_color_hex = (rgb_to_hex(title_src["color"]["r"], title_src["color"]["g"], title_src["color"]["b"])
+                           if title_src and title_src["color"] else "")
+        sample_text = title_src["text"] if title_src else ""
 
         overflow_note = ""
         if c["x"] + c["w"] > canvas_w or c["y"] + c["h"] > canvas_h:
             overflow_note = "EXCEEDS CANVAS — will clip/scroll"
 
+        svg_label, svg_native = _SVG_TYPE_MAP.get(c.get("svgType"), (None, None)) if c.get("svgType") else (None, None)
         rows.append({
             "id": i,
             "tag": c["tag"],
-            "label": (c["id"] or c["cls"] or sample_text or "")[:30],
+            "label": (svg_label or c["id"] or c["cls"] or sample_text or "")[:30],
             "x": c["x"], "y": c["y"], "w": c["w"], "h": c["h"],
             "x_pt": px_to_pt(c["x"]), "y_pt": px_to_pt(c["y"]),
             "w_pt": px_to_pt(c["w"]), "h_pt": px_to_pt(c["h"]),
@@ -319,10 +921,41 @@ def _build_rows_from_containers(kept, texts, canvas_w, canvas_h, detected_w, det
             "font_size_px": font_size_px,
             "font_size_pt": px_to_pt(font_size_px) if font_size_px else "",
             "font_color_hex": font_color_hex,
-            "sample_text": sample_text,
+            "sample_text": svg_label or sample_text,
+            "repeat_key": c.get("repeatKey"),
             "note": overflow_note,
         })
+        if svg_label:
+            rows[-1]["visual_type"] = svg_native
+            if c.get("svgCount"):
+                rows[-1]["item_count"] = c["svgCount"]
 
+    kept_ids = {id(c) for c in kept}
+    for t in texts:
+        if not t.get("repeatKey") or id(t) in kept_ids:
+            continue
+        rows.append({
+            "id": len(rows) + 1, "tag": t["tag"],
+            "label": (t.get("id") or t.get("cls") or t["text"] or "")[:30],
+            "x": t["x"], "y": t["y"], "w": t["w"], "h": t["h"],
+            "x_pt": px_to_pt(t["x"]), "y_pt": px_to_pt(t["y"]),
+            "w_pt": px_to_pt(t["w"]), "h_pt": px_to_pt(t["h"]),
+            "bg_hex": rgb_to_hex(t["bg"]["r"], t["bg"]["g"], t["bg"]["b"]) if t.get("bg") else "",
+            "font_family": (t.get("fontFamily") or "").split(",")[0].strip().strip('"'),
+            "font_size_px": t.get("fontSize", ""),
+            "font_size_pt": px_to_pt(t["fontSize"]) if t.get("fontSize") else "",
+            "font_color_hex": (rgb_to_hex(t["color"]["r"], t["color"]["g"], t["color"]["b"])
+                                if t.get("color") else ""),
+            "sample_text": t["text"],
+            "repeat_key": t["repeatKey"],
+            "_from_text": True,
+            "note": "",
+        })
+
+    rows = collapse_repeated_rows(rows, canvas_w, canvas_h)
+    rows = [r for r in rows if not r.get("_from_text")]
+    for i, r in enumerate(rows, 1):
+        r["id"] = i
     canvas = {"w": canvas_w, "h": canvas_h, "detected_w": detected_w, "detected_h": detected_h}
     return canvas, rows
 
@@ -949,6 +1582,25 @@ def find_sidebar_region(all_elems, W, H):
     bottom = max(e["y"] + e["h"] for e in candidates)
     if bottom - top < 0.5 * H:
         return None
+
+    # Grid guard: if the left-edge elements are just the first column of a
+    # grid of equal cards (KPI strips, department card grids...), they will
+    # have same-row, same-size "twins" further right on the canvas. A real
+    # sidebar's nav/filter items don't. Without this check the whole left
+    # column of content gets misfiled into a fake "Navigation" section and
+    # the rest of the page's cards get scattered into the wrong sections.
+    right_elems = [e for e in all_elems if e["x"] >= max_right - 4]
+    if right_elems:
+        twin_count = 0
+        for c in candidates:
+            for r in right_elems:
+                if (abs(r["y"] - c["y"]) <= 6 and
+                        abs(r["w"] - c["w"]) <= 8 and abs(r["h"] - c["h"]) <= 8):
+                    twin_count += 1
+                    break
+        if twin_count >= max(2, 0.4 * len(candidates)):
+            return None  # it's a card grid, not a sidebar
+
     return max_right, top, bottom
 
 
@@ -1041,6 +1693,9 @@ def build_sections(canvas, panel_rows, text_rows=None, already_widgets=False):
             "font_size_px": e.get("font_size_px", ""), "font_size_pt": e.get("font_size_pt", ""),
             "font_color_hex": e.get("font_color_hex", ""), "bg_hex": e.get("bg_hex", ""),
         }
+        if e.get("visual_type"):
+            w["visual_type"] = e["visual_type"]
+            w["item_count"] = e.get("item_count")
         # in HTML mode the container element IS the background block -- its
         # own box is already exact, so report it as the bg block too
         if e.get("bg_hex"):
@@ -1186,6 +1841,13 @@ def describe_visual(section_name, widget):
     ('likely'/'appears to be') since this is inferred, not read from the
     source."""
     title = (widget.get("title") or "").strip().lower()
+
+    if widget.get("visual_type"):
+        n = widget.get("item_count")
+        items = f" with {n} data items detected" if n else ""
+        return (f"A {widget['title']}{items} -- build with Power BI's native "
+                f"'{widget['visual_type']}' visual. The individual bars/rows/segments are "
+                f"data-driven and intentionally not documented one by one.")
 
     if section_name == "Navigation":
         return f"A navigation menu item — clicking it likely switches the dashboard to the '{widget['title']}' view."
@@ -1777,8 +2439,10 @@ def generate_design_doc(pages, out_path, source_path, mode):
     _add_page_number_footer(doc)
 
     all_sections = [s for pg in pages for s in pg["sections"]]
-    first_canvas = pages[0]["canvas"]
-    first_hero = next((pg["hero_image_path"] for pg in pages if pg.get("hero_image_path")), None)
+    content_pages = [pg for pg in pages if not pg.get("is_shell")] or pages
+    first_canvas = content_pages[0]["canvas"]
+    first_hero = next((pg["hero_image_path"] for pg in content_pages if pg.get("hero_image_path")), None)
+    first_hero_label = content_pages[0].get("label")
     total_overflow = sum(pg.get("overflow_count", 0) for pg in pages)
     pages_with_overflow = [pg for pg in pages if pg.get("overflow_count", 0)]
 
@@ -1793,7 +2457,10 @@ def generate_design_doc(pages, out_path, source_path, mode):
     sec0.left_margin = Inches(0.6)
     sec0.right_margin = Inches(0.6)
     usable_width = sec0.page_width - sec0.left_margin - sec0.right_margin
-    usable_height = sec0.page_height - sec0.top_margin - sec0.bottom_margin - Inches(0.35)
+    usable_height = sec0.page_height - sec0.top_margin - sec0.bottom_margin - Inches(0.6)
+
+    doc.core_properties.author = "Ajith Khan (IN1661), Senior Consultant"
+    doc.core_properties.title = "Wireframe Design Specification"
 
     # ---------------- Cover page: full-bleed colored block, sized to fill the page ----------------
     cover_table = doc.add_table(rows=1, cols=1)
@@ -1827,19 +2494,22 @@ def generate_design_doc(pages, out_path, source_path, mode):
             run.font.color.rgb = _rgb_color(color or accent_text_color)
         return p
 
-    cover_para(space_before=18, space_after=2)
+    cover_para(space_before=14, space_after=2)
     cover_para("WIREFRAME DESIGN SPECIFICATION", size=30, bold=True, space_after=6)
     subtitle = f"{len(pages)} pages - " if multi_page else ""
-    cover_para(f"{subtitle}Layout, color & typography reference for Power BI rebuild", size=13, italic=True, space_after=24)
+    cover_para(f"{subtitle}Layout, color & typography reference for Power BI rebuild", size=13, italic=True, space_after=10)
+    # author credit at the TOP of the cover -- guaranteed to be on page 1
+    # even if the lower part of the cover block ever reflows
+    cover_para("Prepared by  Ajith Khan  \u00b7  IN1661  \u00b7  Senior Consultant", size=13, bold=True, space_after=20)
 
     if first_hero and os.path.exists(first_hero):
         hero_p = cover_para(space_after=4)
         hero_run = hero_p.add_run()
         try:
-            _add_fitted_picture(hero_run, first_hero, 5.6, 4.0)
+            _add_fitted_picture(hero_run, first_hero, 5.6, 3.5)
         except Exception:
             pass
-        cap = f"'{pages[0]['label']}' page as analyzed" if pages[0].get("label") else "Full wireframe as analyzed"
+        cap = f"'{first_hero_label}' page as analyzed" if first_hero_label else "Full wireframe as analyzed"
         cover_para(cap, size=8.5, italic=True, space_after=20)
     else:
         cover_para(space_after=20)
@@ -1874,7 +2544,8 @@ def generate_design_doc(pages, out_path, source_path, mode):
 
     cover_para(space_before=20, space_after=2)
     cover_para(f"Source file: {os.path.basename(source_path)}   |   Mode: {mode}   |   "
-               f"Generated: {__import__('datetime').date.today().isoformat()}", size=9, space_after=10)
+               f"Generated: {__import__('datetime').date.today().isoformat()}", size=9, space_after=2)
+    cover_para("Generated by  Ajith Khan - IN1661,  Senior Consultant", size=9, bold=True, space_after=10)
 
     if total_overflow:
         where = f" (on {len(pages_with_overflow)} of {len(pages)} pages)" if multi_page else ""
@@ -2038,7 +2709,7 @@ def generate_design_doc(pages, out_path, source_path, mode):
 
     setup_row("Page Size (Custom)", f"{first_canvas['w']/96:.2f}\" x {first_canvas['h']/96:.2f}\"   ({first_canvas['w']} x {first_canvas['h']} px)")
     setup_row("Page Background", ACCENT_LIGHT if brightness_of(ACCENT_LIGHT) > 200 else "#FFFFFF")
-    setup_row("Primary / Accent Color", f"#{ACCENT}", swatch=f"#{ACCENT}")
+    setup_row("Primary / Accent Color", f"#{ACCENT.lstrip('#')}", swatch=f"#{ACCENT.lstrip('#')}")
     setup_row("Suggested Font", "Segoe UI (Power BI default) - verify against source" if mode.startswith("Image") else "See each visual's Font Family below")
     setup_row("Grid / Snap", "Enable snap-to-grid at a fine interval (e.g. 4-8 px) for pixel-accurate placement")
 
@@ -2104,6 +2775,8 @@ def generate_design_doc(pages, out_path, source_path, mode):
                 desc_run.font.color.rgb = RGBColor(0x45, 0x45, 0x45)
 
                 table = make_table()
+                if w.get("visual_type"):
+                    add_row(table, "Power BI Visual", w["visual_type"])
                 add_row(table, "Position (X, Y)", f"{w['x']} px, {w['y']} px   ({w['x_pt']} pt, {w['y_pt']} pt)")
                 add_row(table, "Dimensions (W x H)", f"{w['w']} x {w['h']} px   ({w['w_pt']} x {w['h_pt']} pt)")
                 if not w.get("block_uid") and w.get("bg_hex"):
@@ -2208,6 +2881,13 @@ def generate_design_doc(pages, out_path, source_path, mode):
                 snap_cap_run.font.size = Pt(8.5)
                 snap_cap_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
                 doc.add_paragraph()
+
+            for note in pg.get("dedup_notes") or []:
+                note_p = doc.add_paragraph()
+                note_run = note_p.add_run("[shared] " + note)
+                note_run.italic = True
+                note_run.font.size = Pt(9)
+                note_run.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
 
             render_sections(pg["sections"], level_offset=1, numbering_prefix=f"{p_idx}.")
         else:
@@ -2393,9 +3073,17 @@ def scale_sections(sections, scale):
 # Main
 # ----------------------------------------------------------------------------
 
-def _process_page(canvas, rows, text_rows, is_html, screenshot_path, work_dir, no_images, label=None):
+def _process_page(canvas, rows, text_rows, is_html, screenshot_path, work_dir, no_images, label=None, is_shell=False,
+                  crop_subdir=None):
     """Run the full sections/blocks/visuals pipeline for one page's worth
-    of extracted rows, returning a dict ready to hand to generate_design_doc."""
+    of extracted rows, returning a dict ready to hand to generate_design_doc.
+
+    crop_subdir: unique per-page folder name for cropped snapshots. Visual
+    uids restart at w0/blk1 on every page, so without a per-page folder each
+    page's crops OVERWRITE the previous page's files -- and since images are
+    embedded only after all pages are processed, every page's document would
+    end up showing the LAST-processed page's snapshots (the shuffled-images
+    bug)."""
     scale, _ = fit_to_canvas(canvas, rows)
     overflow_count = len([r for r in rows if r["note"]])
 
@@ -2411,13 +3099,15 @@ def _process_page(canvas, rows, text_rows, is_html, screenshot_path, work_dir, n
     image_map = {}
     block_image_map = {}
     if not no_images and screenshot_path:
-        image_map = crop_widget_images(screenshot_path, original_sections, work_dir, canvas)
-        block_image_map = crop_block_images(screenshot_path, original_sections, work_dir, canvas)
+        crop_dir = os.path.join(work_dir, crop_subdir) if crop_subdir else work_dir
+        image_map = crop_widget_images(screenshot_path, original_sections, crop_dir, canvas)
+        block_image_map = crop_block_images(screenshot_path, original_sections, crop_dir, canvas)
 
     sections = scale_sections(original_sections, scale)
 
     return {
         "label": label,
+        "is_shell": is_shell,
         "canvas": canvas,
         "sections": sections,
         "overflow_count": overflow_count,
@@ -2481,7 +3171,12 @@ def main():
             print(f"Detected {len(pages_data)} pages (tabs) in this HTML file:")
             for pd in pages_data:
                 print(f"  - {pd['label']}")
+            pages_data, common_shell = extract_common_elements(pages_data, cw)
+            if common_shell:
+                print(f"  Found {len(common_shell['rows'])} elements common to every page "
+                      f"(header/nav/filters) -- documented once instead of per page.")
         else:
+            common_shell = None
             if not args.no_images:
                 os.makedirs(work_dir, exist_ok=True)
                 screenshot_path = os.path.join(work_dir, "_full_page.png")
@@ -2490,14 +3185,27 @@ def main():
         mode = "Image (estimated)"
         canvas, rows, text_rows = analyze_image(args.input, cw, ch)
         screenshot_path = args.input
+        common_shell = None
     else:
         print(f"Unsupported file type: {ext}. Use .html/.htm or .png/.jpg/.jpeg")
         sys.exit(1)
 
     if pages_data:
-        pages = [_process_page(pd["canvas"], pd["rows"], None, True, pd["screenshot_path"],
-                                work_dir, args.no_images, label=pd["label"])
-                 for pd in pages_data]
+        pages = []
+        for p_i, pd in enumerate(pages_data, 1):
+            safe = "".join(c if c.isalnum() else "_" for c in (pd["label"] or ""))[:30]
+            pg = _process_page(pd["canvas"], pd["rows"], None, True, pd["screenshot_path"],
+                                work_dir, args.no_images, label=pd["label"],
+                                crop_subdir=f"page_{p_i}_{safe}")
+            if pd.get("dedup_notes"):
+                pg["dedup_notes"] = pd["dedup_notes"]
+            pages.append(pg)
+        if common_shell and common_shell["rows"]:
+            shell_page = _process_page(common_shell["canvas"], common_shell["rows"], None, True,
+                                        common_shell["screenshot_path"], work_dir, args.no_images,
+                                        label=common_shell["label"], is_shell=True,
+                                        crop_subdir="common_elements")
+            pages = [shell_page] + pages
     else:
         pages = [_process_page(canvas, rows, text_rows, is_html, screenshot_path,
                                 work_dir, args.no_images, label=None)]
